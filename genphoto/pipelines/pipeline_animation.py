@@ -462,6 +462,71 @@ class GenPhotoPipeline(AnimationPipeline):
             camera_encoder=camera_encoder
         )
 
+    def encode_image(self, image, generator=None):
+        """Encode a PIL/tensor image into VAE latent space.
+
+        Args:
+            image: torch.Tensor of shape [B, C, H, W] in range [-1, 1]
+            generator: optional torch.Generator for sampling
+
+        Returns:
+            latent: torch.Tensor of shape [B, 4, H//8, W//8]
+        """
+        with torch.no_grad():
+            latent_dist = self.vae.encode(image.to(self.vae.dtype).to(self.vae.device)).latent_dist
+            latent = latent_dist.sample(generator=generator)
+            latent = latent * self.vae.config.scaling_factor  # 0.18215
+        return latent
+
+    def get_img2img_timesteps(self, num_inference_steps, strength, device):
+        """Compute the truncated timestep schedule for img2img.
+
+        Args:
+            num_inference_steps: total number of denoising steps
+            strength: float in (0, 1]. 1.0 = fully from noise, 0.0 = no change.
+            device: torch device
+
+        Returns:
+            timesteps: truncated scheduler timesteps
+            num_inference_steps: actual number of steps after truncation
+        """
+        # Set the full schedule first
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+
+        # Determine the starting step index
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start:]
+        num_inference_steps = len(timesteps)
+
+        return timesteps, num_inference_steps
+
+    def prepare_img2img_latents(self, image_latent, video_length, timestep, generator=None):
+        """Replicate image latent across frames and add noise.
+
+        Args:
+            image_latent: [B, C, H, W] clean latent from VAE encoder
+            video_length: number of frames (e.g. 5)
+            timestep: the starting noise timestep
+            generator: optional torch.Generator
+
+        Returns:
+            noised_latents: [B, C, F, H, W] partially-noised latents
+        """
+        device = image_latent.device
+        dtype = image_latent.dtype
+
+        # Replicate across frame dimension: [B, C, H, W] -> [B, C, F, H, W]
+        latents = image_latent.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+
+        # Generate noise of the same shape
+        noise = torch.randn(latents.shape, generator=generator, device=device, dtype=dtype)
+
+        # Add noise to the specified timestep level
+        latents = self.scheduler.add_noise(latents, noise, timestep)
+
+        return latents
+
     def decode_latents(self, latents):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
@@ -587,8 +652,23 @@ class GenPhotoPipeline(AnimationPipeline):
         callback_steps: Optional[int] = 1,
         multidiff_total_steps: int = 1,
         multidiff_overlaps: int = 12,
+        # ---- img2img support ----
+        strength: float = 1.0,
+        init_image_latents: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
+        """
+        Extended __call__ with img2img support.
+
+        New args:
+            strength: float in (0.0, 1.0].
+                - 1.0 (default) = pure text-to-image (original behavior).
+                - < 1.0 = img2img mode. Lower values preserve more of the input image.
+                Recommended range: 0.3 ~ 0.8.
+            init_image_latents: torch.FloatTensor of shape [B, 4, H//8, W//8].
+                Pre-encoded image latents from self.encode_image().
+                Required when strength < 1.0.
+        """
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -596,8 +676,12 @@ class GenPhotoPipeline(AnimationPipeline):
         # Check inputs. Raise error if not correct
         self.check_inputs(prompt, height, width, callback_steps)
 
+        # Validate img2img args
+        is_img2img = init_image_latents is not None and strength < 1.0
+        if is_img2img:
+            assert 0.0 < strength < 1.0, f"strength must be in (0, 1) for img2img, got {strength}"
+
         # Define call parameters
-        # batch_size = 1 if isinstance(prompt, str) else len(prompt)
         batch_size = 1
         if latents is not None:
             batch_size = latents.shape[0]
@@ -605,9 +689,6 @@ class GenPhotoPipeline(AnimationPipeline):
             batch_size = len(prompt)
 
         device = camera_embedding[0].device if isinstance(camera_embedding, list) else camera_embedding.device
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # Encode input prompt
@@ -618,25 +699,41 @@ class GenPhotoPipeline(AnimationPipeline):
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )           # [2bf, l, c]
 
-        # Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        # Prepare timesteps (with optional truncation for img2img)
+        if is_img2img:
+            timesteps, actual_num_steps = self.get_img2img_timesteps(
+                num_inference_steps, strength, device
+            )
+        else:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
+            actual_num_steps = num_inference_steps
 
         # Prepare latent variables
         single_model_length = video_length
         video_length = multidiff_total_steps * (video_length - multidiff_overlaps) + multidiff_overlaps
         num_channels_latents = self.unet.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            video_length,
-            height,
-            width,
-            text_embeddings.dtype,
-            device,
-            generator,
-            latents,
-        )                   # b c f h w
+
+        if is_img2img:
+            # img2img: start from noised image latents
+            latent_timestep = timesteps[:1]  # the first (noisiest) timestep we'll process
+            latents = self.prepare_img2img_latents(
+                init_image_latents, video_length, latent_timestep, generator
+            )
+            latents = latents.to(dtype=text_embeddings.dtype)
+        else:
+            # txt2img: start from random noise (original behavior)
+            latents = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                video_length,
+                height,
+                width,
+                text_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )                   # b c f h w
         latents_dtype = latents.dtype
 
         # Prepare extra step kwargs.
@@ -657,7 +754,7 @@ class GenPhotoPipeline(AnimationPipeline):
                                        for x in camera_embedding_features]
 
         # Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - actual_num_steps * self.scheduler.order
         if isinstance(camera_embedding_features[0], list):
             camera_embedding_features = [[torch.cat([x, x], dim=0) for x in camera_embedding_feature]
                                        for camera_embedding_feature in camera_embedding_features] \
@@ -665,7 +762,7 @@ class GenPhotoPipeline(AnimationPipeline):
         else:
             camera_embedding_features = [torch.cat([x, x], dim=0) for x in camera_embedding_features] \
                 if do_classifier_free_guidance else camera_embedding_features  # [2b c f h w]
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=actual_num_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 noise_pred_full = torch.zeros_like(latents).to(latents.device)
                 mask_full = torch.zeros_like(latents).to(latents.device)
