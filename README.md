@@ -1,165 +1,144 @@
-# [CVPR 2025 Highlight] Generative Photography 
+# Image-Conditioned Generative Photography (img2img Extension)
 
-This repository is the official implementation of [Generative Photography](https://arxiv.org/abs/2412.02168).
+This extension adds **image input support** to [Generative Photography](https://github.com/pandayuanyu/generative-photography) via SDEdit-style latent initialization (Approach 2: img2img).
 
-> **Generative Photography: Scene-Consistent Camera Control for Realistic Text-to-Image Synthesis** <br>
-> [Yu Yuan](https://yuyuan-space.github.io/), [Xijun Wang](https://www.linkedin.com/in/xijun-wang-747475208/), [Yichen Sheng](https://shengcn.github.io/), [Prateek Chennuri](https://www.linkedin.com/in/prateek-chennuri-3a25a8171/), [Xingguang Zhang](https://xg416.github.io/), [Stanley Chan](https://engineering.purdue.edu/ChanGroup/stanleychan.html)<br>
+Instead of generating a scene from a text prompt, you can now provide an **input image** and apply camera parameter variations (bokeh, focal length, shutter speed, color temperature) while preserving the original scene content.
 
-## [[Paper](https://arxiv.org/abs/2412.02168)] [[Project Page](https://yuyuan-space.github.io/GenerativePhotography/)] [[Dataset](https://huggingface.co/datasets/pandaphd/camera_settings)] [[Weights](https://huggingface.co/pandaphd/generative_photography)] [[HF Demo](https://huggingface.co/spaces/pandaphd/generative_photography)]
+## What Changed
 
-![GenPhoto Example](project_page/static/images/Genphoto.gif)
+### Modified file: `genphoto/pipelines/pipeline_animation.py`
 
+Three new methods added to `GenPhotoPipeline`:
 
-## 🔥 Latest News!!
-* [April 4, 2025]: Generative Photography has been selected as **CVPR 2025 Highlight**! 
-* [March 28, 2025]: The [demo](https://huggingface.co/spaces/pandaphd/generative_photography) is accepted by **CVPR 2025 Demo**.
-* [March 25, 2025]: The CVPR camera-ready paper is now available on arXiv.
-* [March 18, 2025]: Focused news on [Purdue ECE](https://engineering.purdue.edu/ECE/News/2025/generative-photography-lays-new-foundations-for-imaging)
-* [March 4, 2025]: Release the Hugging Face Gradio online demo.
-* [March 3, 2025]: Release offical code and pre-trained weights.
-* [Feb 26, 2025]: Paper is accepted by **CVPR 2025**!
-* [Dec 20, 2024]: Release dataset.
+| Method | Purpose |
+|---|---|
+| `encode_image()` | Encodes an input image into VAE latent space |
+| `get_img2img_timesteps()` | Computes truncated timestep schedule based on `strength` |
+| `prepare_img2img_latents()` | Replicates image latent across 5 frames and adds noise |
 
+The `__call__()` method now accepts two new optional parameters:
+- `strength` (float, default=1.0): Controls the denoising strength. 1.0 = pure text-to-image (original behavior, fully backward compatible). Lower values preserve more of the input image.
+- `init_image_latents` (tensor, default=None): Pre-encoded image latents from `encode_image()`.
 
-## Configurations
-### 1. Environment
-* CUDA 12.1, 64-bit Python 3.10 and PyTorch 2.1.1
-* Other environments may also work, at least for PyTorch 1.13.1 and CUDA 11.7
-* Users can use the following commands to install the packages
+**Backward compatibility is fully preserved.** All existing inference scripts (`inference_bokehK.py`, etc.) and `app.py` work without any changes.
+
+### New file: `inference_image.py`
+
+Unified inference script supporting all 4 camera parameter types with image input.
+
+## Installation
+
+No additional dependencies are needed beyond the original `environment.yaml`.
+
+## How to Apply
+
 ```bash
-conda env create -f environment.yaml
-conda activate genphoto
+# Option A: Replace the file directly
+cp genphoto/pipelines/pipeline_animation.py /your/repo/genphoto/pipelines/
+cp inference_image.py /your/repo/
+
+# Option B: Apply the patch
+cd /your/repo
+git apply pipeline_animation.patch
+cp inference_image.py .
 ```
 
-### 2. Prepare Models and Weights
-* Download Stable Diffusion V1.5 (SD1.5) and  pre-trained weights from [Hugging Face](https://huggingface.co/pandaphd/generative_photography). Please note that we add the folder `unet_merged` into Stable Diffusion V1.5 (SD1.5).
+## Usage
 
-### 3. Modify the File Configuration
-* Modify the configuration yaml files in `config` folders, replace all the dataset & ckpt roots with yours
+### Image-conditioned inference (img2img)
 
+```bash
+# Bokeh effect from an input image
+python inference_image.py \
+    --image ./my_photo.jpg \
+    --camera_type bokeh \
+    --camera_values "[2.44, 8.3, 10.1, 17.2, 24.0]" \
+    --config configs/inference_genphoto/adv3_256_384_genphoto_relora_bokehK.yaml \
+    --strength 0.6
 
-* Replace the `sys.path.append` line in `genphoto/data/dataset.py` with your own BokehMe folder path
-```python
-sys.path.append('/your_path/genphoto/data/BokehMe/')
+# Focal length from an input image
+python inference_image.py \
+    --image ./my_photo.jpg \
+    --camera_type focal_length \
+    --camera_values "[25.0, 35.0, 45.0, 55.0, 65.0]" \
+    --config configs/inference_genphoto/adv3_256_384_genphoto_relora_focal_length.yaml \
+    --strength 0.5
+
+# Shutter speed from an input image with a descriptive prompt
+python inference_image.py \
+    --image ./my_photo.jpg \
+    --camera_type shutter_speed \
+    --camera_values "[0.1, 0.3, 0.52, 0.7, 0.8]" \
+    --config configs/inference_genphoto/adv3_256_384_genphoto_relora_shutter_speed.yaml \
+    --strength 0.7 \
+    --prompt "A modern bathroom with a mirror and soft lighting."
+
+# Color temperature from an input image
+python inference_image.py \
+    --image ./my_photo.jpg \
+    --camera_type color_temperature \
+    --camera_values "[5455.0, 5155.0, 5555.0, 6555.0, 7555.0]" \
+    --config configs/inference_genphoto/adv3_256_384_genphoto_relora_color_temperature.yaml \
+    --strength 0.5
 ```
 
+### Pure text-to-image (original behavior)
 
-* Replace all instances of `self.CLIPTokenizer` and `self.CLIPTextModel` in `genphoto/data/dataset.py` with your own Stable Diffusion v1.5 path
-Replace all instances of `CLIPTokenizer` and `CLIPTextModel` in `genphoto/data/dataset.py` with your own Stable Diffusion v1.5 path:
-```python
-self.tokenizer = CLIPTokenizer.from_pretrained("/your_path/stable-diffusion-v1-5/", subfolder="tokenizer")
-self.text_encoder = CLIPTextModel.from_pretrained("/your_path/stable-diffusion-v1-5/", subfolder="text_encoder")
+```bash
+python inference_image.py \
+    --camera_type bokeh \
+    --camera_values "[2.44, 8.3, 10.1, 17.2, 24.0]" \
+    --config configs/inference_genphoto/adv3_256_384_genphoto_relora_bokehK.yaml \
+    --prompt "A young boy wearing an orange jacket is standing on a crosswalk." \
+    --strength 1.0
 ```
 
+## Key Parameters
 
+### `--strength` (most important)
 
-## Inference
+Controls the balance between input image fidelity and camera effect intensity.
 
-```python 
-# For bokeh rendering
-python inference_bokehK.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_bokehK.yaml --base_scene "A young boy wearing an orange jacket is standing on a crosswalk, waiting to cross the street." --bokehK_list "[2.44, 8.3, 10.1, 17.2, 24.0]"
+| Strength | Behavior |
+|---|---|
+| 0.3 | Very faithful to input image, subtle camera effects |
+| 0.5 | Balanced — good starting point |
+| 0.6 | **Recommended default** — noticeable camera effects with reasonable scene preservation |
+| 0.7 | Strong camera effects, some scene details may shift |
+| 0.8 | Very strong camera effects, scene structure preserved but details change |
+| 1.0 | Pure text-to-image (ignores input image entirely) |
 
-# For focal length
-python inference_focal_length.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_focal_length.yaml --base_scene "A cozy living room with a large, comfy sofa and a coffee table." --focal_length_list "[25.0, 35.0, 45.0, 55.0, 65.0]"
+### `--prompt` (optional in img2img mode)
 
-# For shutter speed
-python inference_shutter_speed.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_shutter_speed.yaml --base_scene "A modern bathroom with a mirror and soft lighting." --shutter_speed_list "[0.1, 0.3, 0.52, 0.7, 0.8]"
+When using `--image`, the prompt is optional. If omitted, a generic prompt `"a high quality photograph"` is used — the latent initialization from the image dominates the scene structure. However, providing a descriptive prompt that matches your image will improve quality, since the cross-attention mechanism still uses it during denoising.
 
-# For color temperature 
-python inference_color_temperature.py --config configs/inference_genphoto/adv3_256_384_genphoto_relora_color_temperature.yaml --base_scene "A blue sky with mountains." --color_temperature_list "[5455.0, 5155.0, 5555.0, 6555.0, 7555.0]"
-```
+### Other parameters
 
-## Training
-### 1. Prepare Dataset
-* Download the training and validation camera setting dataset (base images for each camera setting) from [Hugging Face](https://huggingface.co/datasets/pandaphd/camera_settings). 
-We perform the physical simulation on-the-fly in `genphoto/data/dataset.py`.
+| Parameter | Default | Description |
+|---|---|---|
+| `--num_inference_steps` | 25 | Total denoising steps |
+| `--guidance_scale` | 8.0 | Classifier-free guidance scale |
+| `--height` | 256 | Output height |
+| `--width` | 384 | Output width |
+| `--seed` | 42 | Random seed |
+| `--negative_prompt` | None | Negative prompt for CFG |
+| `--output_dir` | auto | Output directory |
 
+## Output
 
-* [optional] Using [LLaVA](https://github.com/haotian-liu/LLaVA) or other vision language models to generate a caption for each base image. We already provide our extracted captions in the `annotations/xxxx.json` files
+The script produces:
+- `{camera_type}_img2img.gif` — Animated GIF of all 5 parameter variants
+- `{camera_type}_frames/` — Individual PNG frames for each parameter value
+- `input_resized.png` — The input image resized to model resolution (for comparison)
 
+## How It Works
 
-### 2. Modify the Training Configuration
-* Modify the training hyperparameter in the training yaml files located in `configs/train_genphoto`,
-you can resume the training from our provided weights
+1. **Encode** the input image through the SD1.5 VAE encoder → clean latent `z₀`
+2. **Replicate** across 5 frames: `z₀ → [z₀, z₀, z₀, z₀, z₀]`
+3. **Add noise** to an intermediate timestep determined by `strength`
+4. **Denoise** from this partially-noised state (skipping early steps), with:
+   - Camera adaptor injecting ISP parameter variations via temporal/self-attention
+   - Text prompt providing scene semantics via cross-attention
+5. **Decode** each frame back to pixel space via VAE decoder
 
-
-### 3. Training Examples
-
-```python 
-# example for training bokeh rendering
-python -m torch.distributed.launch --nproc_per_node=1 --use_env train_bokehK.py --config configs/train_genphoto/adv3_256_384_genphoto_relora_bokehK.yaml
-```
-
-
-## Demo
-We provide the Gradio demo, use following script:
-
-```python
-python app.py 
-```
-You can also visit our online [Hugging Face demo](https://huggingface.co/spaces/pandaphd/generative_photography)  
-
-## Evaluation
-
-We provide the evaluation metrics code in `comp_metrics/` folder
-
-
-## Some Future Directions for Generative Photography
-Generative Photography is a new research
-domain that requires much more research to be
-further refined. Below are some potential
-future research directions. We welcome 
-researchers to follow up on this work 
-from these perspectives, and we are 
-always open to collaboration.
-
-
-* Support Complex Camera Settings: Currently we only support single camera setting control during generation.
-It is theoretically feasible to simultaneously embed complex camera settings in a
- high-dimensional encoding form. It takes some engineering efforts on the realistic data simulation pipeline as it
- requires a long and dedicated sequence of the real-world
- simulation, such as performing optical simulation (focal
- length and aperture) first, followed by CMOS simulation
- (exposure time and color temperature).
-
-
-* Support Camera Refocused Disparity Bokeh Rendering: The current
-bokeh rendering only supports rendering with the bokeh 
-blur parameter, with the refocused disparity fixed at 0.96
-for all scenes. Dynamic refocused disparity requires the
-generative model to have a better understanding of scene depth.
-
-
-* Wider Camera Setting Spectrum: Currently, due to data rendering and other factors, the supported focal
-length range is 24-70mm. There is a demand for a wider spectrum.
-
-
-* Minimize the Simulation Bias: Simple physics-based rendering is reliable but also introduces certain biases that are inconsistent 
-with the real world, such as the lack of true optical distortions.
-
-
-* Adapt to the DiT Architecture and Larger Resolution: For better quality.
-
-
-* Adapt Generative Photography to Generative Videography
-
-
-
-## Disclaimer
-This project is released for academic use. We disclaim responsibility for user-generated content. Users are solely liable for their actions. The project contributors are not legally affiliated with, nor accountable for, users' behaviors. Use the generative model responsibly, adhering to ethical and legal standards. 
-
-
-## Acknowledgement
-We thank [AnimateDiff](https://github.com/guoyww/AnimateDiff) and [CameraCtrl](https://github.com/hehao13/CameraCtrl) for their amazing jobs.
-
-
-## BibTeX
-If you feel this project helpful/insightful, please cite our paper:
-```bibtex
-@article{Yuan_2024_GenPhoto,
-  title={Generative Photography: Scene-Consistent Camera Control for Realistic Text-to-Image Synthesis},
-  author={Yuan, Yu and Wang, Xijun and Sheng, Yichen and Chennuri, Prateek and Zhang, Xingguang and Chan, Stanley},
-  journal={arXiv preprint arXiv:2412.02168},
-  year={2024}
-}
-```
+The key insight is that the camera parameter pathway (Camera Adaptor) and the scene content pathway (CLIP text encoder → cross-attention) are **architecturally independent**. The img2img latent initialization replaces the text-based scene conditioning with direct visual information, while the camera adaptor continues to function exactly as designed.
